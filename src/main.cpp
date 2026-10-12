@@ -287,6 +287,16 @@ void TabWeapons(const game::Snapshot& s) {
     ImGui::TextDisabled("Applies to whatever weapon is in your hands.");
     if (s.havePlayer && s.weaponId >= 0)
         ImGui::TextDisabled("magazine %.0f%%   spare clips %d", s.ammo * 100.f, s.clips);
+
+    Section("EXPLOSIVE ROUNDS");
+    ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(1.f, 0.35f, 0.35f, 1.f));
+    Check("Swap Bullet Type", c.bulletSwap);
+    ImGui::PopStyleColor();
+    static const char* kBulletTypes[] = { "Rocket (explodes)", "Freeze shot", "Blaster bolt", "Sniper round (pierces)" };
+    int bt = c.bulletType;
+    ImGui::SetNextItemWidth(-70);
+    if (ImGui::Combo("Bullets", &bt, kBulletTypes, IM_ARRAYSIZE(kBulletTypes))) c.bulletType = bt;
+    ImGui::TextDisabled("Pistol, SMG, shotgun, minigun, sniper, blaster and freeze gun\nfire these instead. Fire rate stays your gun's own.");
 }
 
 void TabEnemies(const game::Snapshot& s) {
@@ -334,9 +344,7 @@ void TabAim(const game::Snapshot& s) {
 
     Section("BULLETS");
     Check("Silent Aim", c.silentAim);
-    ImGui::SetNextItemWidth(-70);
-    SliderF("Cone", c.silentFov, 10.f, 360.f, "%.0f deg");
-    ImGui::TextDisabled("New shots fly at the enemy nearest your facing. Your aim isn't moved.");
+    ImGui::TextDisabled("Shots go to the closest enemies (spread across the crowd). Your aim isn't moved.");
     ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(1.f, 0.35f, 0.35f, 1.f));
     Check("Magic Bullet (homing)", c.magicBullet);
     ImGui::PopStyleColor();
@@ -376,11 +384,18 @@ void TabVisuals() {
     Check("Other Players", c.espPlayers);
     Check("Local Player", c.espLocal);
 
+    Section("DROPS");
+    Check("Drop ESP (cash, ammo, health, powerups)", c.espDrops);
+    Check("Despawn timer", c.espDropTimer);
+
     Section("LEGEND");
     Swatch(IM_COL32(255, 77, 77, 255));  ImGui::SameLine(); ImGui::TextDisabled("enemy");
     ImGui::SameLine(); Swatch(IM_COL32(255, 60, 200, 255)); ImGui::SameLine(); ImGui::TextDisabled("boss");
     ImGui::SameLine(); Swatch(IM_COL32(90, 200, 255, 255)); ImGui::SameLine(); ImGui::TextDisabled("frozen");
-    Swatch(IM_COL32(255, 150, 40, 255)); ImGui::SameLine(); ImGui::TextDisabled("player");
+    Swatch(IM_COL32(255, 215, 60, 255)); ImGui::SameLine(); ImGui::TextDisabled("cash");
+    ImGui::SameLine(); Swatch(IM_COL32(70, 230, 110, 255)); ImGui::SameLine(); ImGui::TextDisabled("health");
+    ImGui::SameLine(); Swatch(IM_COL32(190, 110, 255, 255)); ImGui::SameLine(); ImGui::TextDisabled("powerup");
+    Swatch(IM_COL32(255, 150, 40, 255)); ImGui::SameLine(); ImGui::TextDisabled("player / ammo");
     ImGui::SameLine(); Swatch(IM_COL32(60, 255, 120, 255)); ImGui::SameLine(); ImGui::TextDisabled("you");
 }
 
@@ -559,6 +574,38 @@ void DrawEsp(const game::Snapshot& s) {
                 col = ImGui::GetColorU32(ImVec4(r, g, b, 1.f));
             } else if (e.frozen) col = IM_COL32(90, 200, 255, 255);
             draw(e, col, EnemyHeight(e.type));
+        }
+    }
+    if (c.espDrops) {
+        static const char* kPw[] = { "Speed Boost", "Invulnerability", "Magnet", "Fast Reload", "Invisibility" };
+        for (auto& d : s.drops) {
+            float dx = d.pos.x - me.x, dz = d.pos.z - me.z;
+            float dist = std::sqrt(dx * dx + dz * dz);
+            if (dist > c.espMaxDist) continue;
+            ImVec2 sp;
+            if (!Project(s, d.pos.x, d.pos.y + 0.3f, d.pos.z, sp)) continue;
+            ImU32 col; const char* name;
+            switch (d.type) {
+            case 0:  col = IM_COL32(255, 215, 60, 255);  name = "Cash"; break;
+            case 1:  col = IM_COL32(255, 150, 40, 255);  name = "Ammo"; break;
+            case 2:  col = IM_COL32(70, 230, 110, 255);  name = "Health"; break;
+            default: col = IM_COL32(190, 110, 255, 255); name = (d.sub >= 0 && d.sub < 5) ? kPw[d.sub] : "Powerup"; break;
+            }
+            // blink during the last 3 seconds before it despawns
+            bool fading = d.timeLeft < 3.f && std::fmod(t * 4.f, 1.f) < 0.5f;
+            ImU32 fill = fading ? (col & 0x00FFFFFF) | 0x50000000 : (col & 0x00FFFFFF) | 0xC0000000;
+            const float r = 5.f;
+            ImVec2 pts[4] = { {sp.x, sp.y - r}, {sp.x + r, sp.y}, {sp.x, sp.y + r}, {sp.x - r, sp.y} };
+            dl->AddConvexPolyFilled(pts, 4, fill);
+            dl->AddPolyline(pts, 4, 0xE0000000, ImDrawFlags_Closed, 1.f);
+            if (c.espLines) dl->AddLine(origin, sp, (col & 0x00FFFFFF) | 0x40000000, 1.f);
+            char lbl[48];
+            if (c.espDropTimer) snprintf(lbl, sizeof(lbl), "%s  %.0fs", name, d.timeLeft);
+            else snprintf(lbl, sizeof(lbl), "%s", name);
+            ImVec2 sz = font->CalcTextSizeA(fs, FLT_MAX, 0, lbl);
+            ImVec2 tp(sp.x - sz.x * 0.5f, sp.y - r - 2 - lh);
+            dl->AddText(font, fs, ImVec2(tp.x + 1, tp.y + 1), 0xE0000000, lbl);
+            dl->AddText(font, fs, tp, col, lbl);
         }
     }
     for (auto& p : s.players) {

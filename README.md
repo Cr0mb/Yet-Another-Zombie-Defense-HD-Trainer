@@ -59,19 +59,29 @@ The ESP reads Unity's native `Camera` world-to-clip matrix (`m_CachedPtr + 0xDC`
 only used if it equals `projection × view`, which are read from the same native camera
 (`+0x9C`, `+0x5C`). If the layout ever moves, ESP turns itself off instead of drawing garbage.
 
-### Online safety
+### Online play
 
-The trainer watches `YAZDMultiplayer.isOnlineMultiplayer` all the time. When you join or host an
-**online** game:
+Almost every feature works in online co-op, whether you host or join, including the aim
+features. The trainer watches `YAZDMultiplayer.isOnlineMultiplayer` and shows **ONLINE** in the
+menu footer.
 
-* **Every write feature is disabled.** These features would desync or crash network sessions.
-  Their tabs are greyed out and show a notice.
-* **Values the trainer changed are restored.** This covers immortality, stats and powerup timers.
-* **Queued one-shot actions are dropped.**
-* **ESP keeps working.** It only reads memory.
+**God Mode and Infinite Health only work when you are the host.** In online co-op, the host runs
+all damage to players and sends each client its HP (`PlayerHitMessage`). The game also forces
+`isImmortal` on for clients every frame, so that only the host decides deaths. As a client, these
+two features look active on your screen, but the host's next update overwrites them. The PLAYER
+tab says so while you're online.
 
-If the multiplayer state can't be read while a game is loaded, the trainer treats the game as
-online. A failed read never turns writes on. Single-player and local co-op work normally.
+### Test log
+
+`trainer.log`, next to the exe, keeps a running record that is appended to on every launch:
+
+* every toggle switched on or off
+* every bullet swap
+* every triggerbot press and release
+* a status line every 2 s with your HP, immortality, ammo, cash, enemies alive, memory writes
+  (succeeded and failed) and bullets steered or teleported
+
+If the game misbehaves, the last lines show what was on and what had just happened.
 
 ### Auto-attach
 
@@ -150,9 +160,35 @@ load automatically when the trainer attaches.
 * Instant Reload: reloads finish immediately and still use up a clip
 * Infinite Clips
 
+### Explosive Rounds (bullet swap)
+
+Your guns fire another weapon's bullets. Choose one bullet type:
+
+* **Rocket:** explodes on contact
+* **Freeze shot**
+* **Blaster bolt**
+* **Sniper round:** goes through enemies
+
+**How it works.** Every player owns an instance of every weapon, bought or not, and each one has a
+`bulletPrefab`. A gun only creates a bullet from its prefab when no pooled bullet is free. The
+trainer points each gun's `bulletPrefab` at the chosen weapon's prefab, then empties the gun's
+pool (`bulletsList`). It also resets `lastBulletUsed` to 0. Without that reset, the game's search
+for a free bullet never ends on the shorter list and the game hangs.
+
+From the next shot on, the gun builds and reuses the new bullets. A rocket explodes through the
+game's own code, so blast damage, kills, rewards and online sync all behave normally. Turning the
+feature off, or closing the trainer, puts each gun's original bullets back.
+
+* **Guns it applies to:** pistol, SMG, shotgun, minigun, sniper rifle, blaster, freeze gun and
+  rocket launcher.
+* **Excluded:** the flamethrower, laser, tesla coil, chainsaw and cluster grenade handle their own
+  bullets, so they are never changed.
+* **Fire rate:** each gun keeps its own. Rapid Fire with rockets makes a rocket machine gun, so
+  make a backup save first.
+
 ## Aim
 
-All four aim features work only offline and only during the night (combat) phase. They switch
+All four aim features run during the night (combat) phase, offline and online. They switch
 themselves off while the menu is open or the game is not the foreground window. **Range** (5–80 m,
 default 40 m) is shared by all four: enemies further away are ignored.
 
@@ -160,8 +196,8 @@ default 40 m) is shared by all four: enemies further away are ignored.
 |---|---|---|---|
 | **Aimbot** | Pulls your crosshair onto the enemy nearest the cursor while the hold key is down. | The game turns the player toward the point where the mouse ray meets the ground plane (`y = 1`). The aimbot projects the enemy's `y = 1` point to the screen and moves the real cursor there with `SetCursorPos`. The game then rotates the player by itself, so the aimbot never fights the game's per-frame rotation blending. | Hold key (Always, Right Mouse, Shift, Mouse 4, Mouse 5, Alt; default Right Mouse), FOV radius in pixels around the cursor (20–600, default 150), Smooth (1 = snap, up to 20; default 4), Draw FOV circle (red when a target is inside) |
 | **Triggerbot** | Fires automatically while you are facing an enemy. | Reads `Player.rotation` and checks whether the line you face passes within *Width* of an enemy ahead of you. While it does, the left mouse button is held down with `SendInput`, since the game fires while the button is down. The button is released when no enemy is on the line. It never releases a button you are physically holding. | Width (0.2–1.5 m, default 0.5 m) |
-| **Silent Aim** | New shots fly at an enemy even when you aren't aiming at it. Your visible aim isn't moved. | Each weapon keeps its bullets in a pool (`ShootingWeapon.bulletsList`). When one of your bullets is fired (`lifeTime < 0.15 s`), its `movementVector` is turned toward the enemy nearest your facing direction, keeping its speed. Each shot is redirected only once. | Cone (10–360°, default 60°) around the direction you face |
-| **Magic Bullet** | Your bullets home on enemies. | Every tick, each of your bullets in flight has its `movementVector` steered toward a target. A new shot goes to the Silent Aim target; after that, each bullet chases the enemy nearest it. **Instant hit** also moves the bullet to just in front of its target once. The game's next segment test (`previousPosition → position`) then runs through the enemy, so the hit, damage, kill and rewards are processed by the game itself. | Instant hit (on/off) |
+| **Silent Aim** | Your shots go to the closest enemies, in any direction, without moving your visible aim. | Each weapon keeps its bullets in a pool (`ShootingWeapon.bulletsList`). A new shot (`lifeTime < 0.15 s`) is given the nearest enemy as its target. Damage is spread across the crowd: the trainer adds up the damage already in flight toward each enemy (from `Bullet.damage`), and once that covers the enemy's HP, the next shots go to the next-closest enemy. Bullets keep steering toward their target and aim ahead of where it is moving. If a bullet's target dies, the bullet picks the next enemy closest to it. | none (uses Range) |
+| **Magic Bullet** | Your bullets home on enemies. | Works like Silent Aim, but a bullet can retarget at any point in its flight and turn fully around. **Instant hit** also moves each bullet to just in front of its target once. The game's next collision test (`previousPosition → position`) then runs through the enemy, so the game itself handles the hit, damage, kill and rewards. | Instant hit (on/off) |
 
 ### Known limitations
 
@@ -177,10 +213,6 @@ default 40 m) is shared by all four: enemies further away are ignored.
   bullet for up to 3 s.
 * **The aimbot needs a camera.** It uses the validated camera matrix like ESP does. If the matrix
   fails validation, the aimbot does nothing.
-* **Disabled online.** Like every other gameplay feature, all four are blocked in online games.
-* **Not yet tested in a live game.** The bullet and rotation field offsets are looked up by name
-  and the build compiles. The in-game behaviour still has to be tried. The self-test reports
-  whether the new offsets were found.
 
 ## Enemies
 
@@ -205,6 +237,14 @@ default 40 m) is shared by all four: enemies further away are ignored.
 * Boss highlight: the Demon Lord and the Reaper get an animated rainbow outline
 * Frozen enemies are shown in cyan
 * Filters: enemies, other players, local player
+* **Drop ESP:** every item on the ground, color-coded:
+  * cash: gold
+  * ammo: orange
+  * health: green
+  * powerups: purple, labelled with their name (Speed Boost, Invulnerability, Magnet,
+    Fast Reload, Invisibility)
+
+  An optional despawn timer shows the seconds left, and the item blinks during its last 3 s.
 
 ## Game
 
@@ -230,6 +270,13 @@ default 40 m) is shared by all four: enemies further away are ignored.
   `previousPosition = position`, then adds `movementVector × min(dt, 0.1)` to the position. After
   that, `Bullet.Update` tests the segment from `previousPosition` (pulled back 0.5) to `position`
   against each enemy's circle (`collisionRadius`).
+* **Drops:** items live in `Level.gameObjectsByID`, a `Dictionary<int, YAZDObject>`. The
+  dictionary's `entries`/`count` offsets are read from the live object's class the first time it
+  exists. Each entry has the layout `{ int hashCode; int next; int key; obj value }`. An `int` key
+  hashes to itself, so the trainer checks that `key == hashCode` on every used entry before
+  trusting the layout. If the check fails, drop ESP turns off. Items are recognised as
+  `MoneyItem`, `AmmoItem`, `HealthItem` or `PowerupItem`. Time left is
+  `removeAfter − lifeTime`, and items already picked up (`collected`) are skipped.
 * **Ammo values:** `ShootingWeapon.ammoLeft` is a fraction of a full magazine, where `1.0` is
   full. Spare clips are counted in the store as `Store.StoreItem.availableAmmo`.
 
@@ -242,8 +289,8 @@ src/main.cpp    overlay window, menu (GVoid theme), ESP
 src/game.cpp    offset resolution, feature worker, snapshot, config, self-test
 src/mono.cpp    remote Mono API resolver (stub + remote thread)
 src/mem.cpp     process attach, RPM/WPM, module + window lookup
-re/decomp/      decompiled Assembly-CSharp (reference)
-re/proto/       Python prototypes used during reverse engineering
+src/log.cpp     trainer.log (appended each launch)
+third_party/    Dear ImGui 1.92.9 (MIT)
 ```
 
 Not affiliated with Awesome Games Studio.

@@ -47,7 +47,16 @@ struct Off {
     int eType = -1;
     // aim: YAZDObject motion + ShootingWeapon.Bullet
     int oPrev = -1, oMove = -1, oRot = -1, oLife = -1, oCollide = -1;
-    int wBullets = -1, bActive = -1, bOwner = -1;
+    int wBullets = -1, bActive = -1, bOwner = -1, bDamage = -1;
+    // drops: Level.gameObjectsByID (Dictionary<int, YAZDObject>) + Item classes
+    uint64_t sObjById = 0, kItemType[4] = {};
+    int itCollected = -1, itRemoveAfter = -1, puType = -1;
+    int dEntries = -1, dCount = -1;          // resolved lazily from the live dictionary
+    bool dictBad = false;
+    // bullet swap
+    int wPrefab = -1, wLastBullet = -1;
+    uint64_t kDonor[4] = {};
+    std::set<uint64_t> kSwapOK;              // weapons that treat their bullets generically
 };
 
 // Unity 2019.4 native Camera: worldToClip (column-major float4x4) and the
@@ -162,7 +171,18 @@ bool Resolve() {
     o.wBullets = F(kShoot, "bulletsList");
     uint64_t kBullet = kShoot ? mono::NestedClass(kShoot, "Bullet") : 0;
     if (!kBullet) { ok = false; log_::Error("ShootingWeapon.Bullet missing"); }
-    o.bActive = F(kBullet, "IsActive"); o.bOwner = F(kBullet, "owner");
+    o.sObjById = S(kLevel, "gameObjectsByID");
+    uint64_t kItemB = C("Item");
+    o.kItemType[0] = C("MoneyItem"); o.kItemType[1] = C("AmmoItem");
+    o.kItemType[2] = C("HealthItem"); o.kItemType[3] = C("PowerupItem");
+    o.itCollected = F(kItemB, "collected"); o.itRemoveAfter = F(kItemB, "removeAfter");
+    o.puType = F(o.kItemType[3], "powerupType");
+    o.wPrefab = F(kShoot, "bulletPrefab"); o.wLastBullet = F(kShoot, "lastBulletUsed");
+    { const char* d[4] = { "RocketLauncher", "FreezeGun", "Blaster", "SniperRifle" };
+      for (int i = 0; i < 4; ++i) o.kDonor[i] = C(d[i]); }
+    for (const char* n : { "Pistol", "SMG", "Shotgun", "Minigun", "SniperRifle", "Blaster", "FreezeGun", "RocketLauncher" })
+        if (uint64_t k = mono::Class(img, "", n)) o.kSwapOK.insert(k);
+    o.bActive = F(kBullet, "IsActive"); o.bOwner = F(kBullet, "owner"); o.bDamage = F(kBullet, "damage");
 
     // Every concrete ShootingWeapon. A weapon object is only written to after
     // its class is confirmed to be one of these.
@@ -407,9 +427,14 @@ void ApplyDefenses(uint64_t level) {
 //  just short of an enemy makes the next frame's segment pass through it.
 //  Only x/z are touched; y (lobbed grenades) is left to the game.
 // ---------------------------------------------------------------------------
-struct AimTarget { float x, z; };
-std::unordered_map<uint64_t, float> g_bulletLife;   // bullet -> lifeTime last seen
-std::unordered_set<uint64_t> g_redirected, g_teleported;
+struct AimTarget {
+    uint64_t obj;
+    float x, z, vx, vz;     // position + velocity (for leading)
+    float hp;
+    float incoming = 0;     // damage already in flight toward it this tick
+};
+struct BulletState { float life; uint64_t target; bool teleported; };
+std::unordered_map<uint64_t, BulletState> g_bullets;   // bullet -> what we did with it
 std::atomic<unsigned> g_nSteer{0}, g_nTeleport{0};
 
 float AngleWrap(float a) {
@@ -422,82 +447,214 @@ std::vector<AimTarget> AliveEnemies(uint64_t level) {
     std::vector<AimTarget> v;
     ForList(mem::Read<uint64_t>(level + g_o.lEnemies), [&](uint64_t e) {
         if (Klass(e) != g_o.kEnemy || mem::Read<bool>(e + g_o.cDead)) return;
-        if (mem::Read<float>(e + g_o.cHp) <= 0.f || !mem::Read<bool>(e + g_o.oCollide)) return;
-        Vec3 p{}; mem::ReadRaw(e + g_o.oPos, &p, sizeof(p));
-        v.push_back({ p.x, p.z });
+        float hp = mem::Read<float>(e + g_o.cHp);
+        if (hp <= 0.f || !mem::Read<bool>(e + g_o.oCollide)) return;
+        Vec3 p{}, mv{};
+        mem::ReadRaw(e + g_o.oPos, &p, sizeof(p));
+        mem::ReadRaw(e + g_o.oMove, &mv, sizeof(mv));
+        v.push_back({ e, p.x, p.z, mv.x, mv.z, hp });
     });
     return v;
 }
 
-// Enemy closest to direction `ang` (radians) seen from (ox, oz), inside the cone and range.
-const AimTarget* BestInCone(const std::vector<AimTarget>& es, float ox, float oz, float ang, float halfFov, float range) {
-    const AimTarget* best = nullptr; float bestScore = 1e9f;
+// Nearest target to (ox, oz) inside the cone and range. Enemies whose HP is already covered
+// by bullets in flight are skipped, so a stream of shots spreads over the crowd
+// instead of all chasing one zombie. If every candidate is covered, the best
+// covered one is used rather than wasting the shot.
+AimTarget* PickTarget(std::vector<AimTarget>& es, float ox, float oz, float ang, float halfFov, float range) {
+    AimTarget* best = nullptr; AimTarget* bestCovered = nullptr;
+    float bs = 1e9f, bcs = 1e9f;
     for (auto& e : es) {
         float dx = e.x - ox, dz = e.z - oz, d = std::sqrt(dx * dx + dz * dz);
         if (d < 0.05f || d > range) continue;
         float diff = std::fabs(AngleWrap(std::atan2(dz, dx) - ang));
         if (diff > halfFov) continue;
-        float score = diff * 10.f + d * 0.02f;
-        if (score < bestScore) { bestScore = score; best = &e; }
+        float score = d + diff * 0.01f;            // nearest first; angle only breaks ties
+        if (e.incoming < e.hp) { if (score < bs) { bs = score; best = &e; } }
+        else if (score < bcs) { bcs = score; bestCovered = &e; }
     }
-    return best;
+    return best ? best : bestCovered;
+}
+
+AimTarget* FindObj(std::vector<AimTarget>& es, uint64_t obj) {
+    for (auto& e : es) if (e.obj == obj) return &e;
+    return nullptr;
 }
 
 void ApplyAim(uint64_t player, uint64_t level) {
     auto& c = g_cfg;
-    if (!c.silentAim && !c.magicBullet) { g_bulletLife.clear(); g_redirected.clear(); g_teleported.clear(); return; }
+    if (!c.silentAim && !c.magicBullet) { g_bullets.clear(); return; }
     auto enemies = AliveEnemies(level);
     if (enemies.empty()) return;
     Vec3 me{}; mem::ReadRaw(player + g_o.oPos, &me, sizeof(me));
     float rot = mem::Read<float>(player + g_o.oRot);
     float range = c.aimRange;
-    const float kDeg = 0.01745329f;
-    const AimTarget* aimT = BestInCone(enemies, me.x, me.z, rot, c.silentFov * 0.5f * kDeg, range);
 
+    // Gather this player's live bullets first so already-assigned damage is
+    // known before any new shot picks a target.
+    struct Live { uint64_t b; Vec3 pos, mv; float spd, dmg; BulletState* st; bool fresh; };
+    std::vector<Live> live;
     ForList(mem::Read<uint64_t>(player + g_o.pWeapons), [&](uint64_t w) {
         if (!g_o.kShooting.count(Klass(w))) return;
         ForList(mem::Read<uint64_t>(w + g_o.wBullets), [&](uint64_t b) {
             if (!mem::Read<bool>(b + g_o.bActive) || !mem::Read<bool>(b + g_o.oCollide)) return;
             if (mem::Read<uint64_t>(b + g_o.bOwner) != player) return;
+            float lifeT = mem::Read<float>(b + g_o.oLife);
+            auto it = g_bullets.find(b);
             // pooled: a lifeTime that went backwards is a new shot from the same object
-            float life = mem::Read<float>(b + g_o.oLife);
-            auto it = g_bulletLife.find(b);
-            if (it != g_bulletLife.end() && life < it->second) { g_redirected.erase(b); g_teleported.erase(b); }
-            g_bulletLife[b] = life;
-            if (life > 3.f) return;
-
-            Vec3 pos{}, mv{};
-            mem::ReadRaw(b + g_o.oPos, &pos, sizeof(pos));
-            mem::ReadRaw(b + g_o.oMove, &mv, sizeof(mv));
-            float spd = std::sqrt(mv.x * mv.x + mv.z * mv.z);
-            if (spd < 0.5f) return;
-
-            const AimTarget* t = nullptr;
-            if (c.magicBullet) {
-                // fresh shots go to the aim target; after that, home on whatever is nearest the bullet
-                if (aimT && !g_redirected.count(b) && life < 0.15f) t = aimT;
-                else t = BestInCone(enemies, pos.x, pos.z, std::atan2(mv.z, mv.x), 3.1416f, range);
-            } else if (c.silentAim && life < 0.15f && !g_redirected.count(b)) {
-                t = aimT;
-            }
-            if (!t) return;
-            float dx = t->x - pos.x, dz = t->z - pos.z, d = std::sqrt(dx * dx + dz * dz);
-            if (d < 0.01f) return;
-            dx /= d; dz /= d;
-            mem::Write<float>(b + g_o.oMove, dx * spd);
-            mem::Write<float>(b + g_o.oMove + 8, dz * spd);
-            g_redirected.insert(b);
-            g_nSteer++;
-            if (c.magicBullet && c.magicInstant && !g_teleported.count(b) && d > 0.6f) {
-                // park it just short of the target; next frame's segment runs through it
-                mem::Write<float>(b + g_o.oPos, t->x - dx * 0.35f);
-                mem::Write<float>(b + g_o.oPos + 8, t->z - dz * 0.35f);
-                g_teleported.insert(b);
-                g_nTeleport++;
-            }
+            if (it == g_bullets.end() || lifeT < it->second.life) it = g_bullets.insert_or_assign(b, BulletState{ lifeT, 0, false }).first;
+            it->second.life = lifeT;
+            if (lifeT > 3.f) return;
+            Live l{ b };
+            mem::ReadRaw(b + g_o.oPos, &l.pos, sizeof(l.pos));
+            mem::ReadRaw(b + g_o.oMove, &l.mv, sizeof(l.mv));
+            l.spd = std::sqrt(l.mv.x * l.mv.x + l.mv.z * l.mv.z);
+            if (l.spd < 0.5f) return;
+            l.dmg = mem::Read<float>(b + g_o.bDamage);
+            if (!(l.dmg > 0.f && l.dmg < 1e5f)) l.dmg = 0.1f;
+            l.st = &it->second;
+            l.fresh = lifeT < 0.15f;
+            live.push_back(l);
         });
     });
-    if (g_bulletLife.size() > 4096) { g_bulletLife.clear(); g_redirected.clear(); g_teleported.clear(); }
+    for (auto& l : live)
+        if (AimTarget* t = l.st->target ? FindObj(enemies, l.st->target) : nullptr) t->incoming += l.dmg;
+
+    for (auto& l : live) {
+        AimTarget* t = l.st->target ? FindObj(enemies, l.st->target) : nullptr;
+        if (!t) {
+            l.st->target = 0;
+            if (l.fresh) {
+                // a new shot: target picked from where the player stands and faces
+                t = PickTarget(enemies, me.x, me.z, rot, 3.1416f, range);   // closest to you, any direction
+            } else if (c.magicBullet || l.st->life < 1.5f) {
+                // its target died (or it never had one): pick the next one from the
+                // bullet's own position, ahead of where it is flying
+                float heading = std::atan2(l.mv.z, l.mv.x);
+                t = PickTarget(enemies, l.pos.x, l.pos.z, heading, 3.1416f, range);
+            }
+            if (!t) continue;
+            l.st->target = t->obj;
+            t->incoming += l.dmg;
+        }
+        // lead: aim where the enemy will be when the bullet gets there
+        float dx = t->x - l.pos.x, dz = t->z - l.pos.z, d = std::sqrt(dx * dx + dz * dz);
+        float tt = (std::min)(d / l.spd, 1.f);
+        float ax = t->x + t->vx * tt, az = t->z + t->vz * tt;
+        dx = ax - l.pos.x; dz = az - l.pos.z; d = std::sqrt(dx * dx + dz * dz);
+        if (d < 0.01f) continue;
+        dx /= d; dz /= d;
+        mem::Write<float>(l.b + g_o.oMove, dx * l.spd);
+        mem::Write<float>(l.b + g_o.oMove + 8, dz * l.spd);
+        g_nSteer++;
+        if (c.magicBullet && c.magicInstant && !l.st->teleported && d > 0.6f) {
+            // park it just short of the target; next frame's segment runs through it
+            mem::Write<float>(l.b + g_o.oPos, t->x - dx * 0.35f);
+            mem::Write<float>(l.b + g_o.oPos + 8, t->z - dz * 0.35f);
+            l.st->teleported = true;
+            g_nTeleport++;
+        }
+    }
+    if (g_bullets.size() > 4096) g_bullets.clear();
+}
+
+// ---------------------------------------------------------------------------
+//  Bullet swap. Every player owns an instance of every weapon (bought or not),
+//  each with a bulletPrefab. A weapon only instantiates from its prefab when no
+//  pooled bullet is free, so pointing the prefab at a donor weapon's prefab and
+//  emptying the pool (List._size = 0) makes it fire the donor's bullets: a
+//  RocketLauncherBullet explodes on contact through the game's own code. Only
+//  weapons that use their bullets generically are changed (not Flamethrower,
+//  Laser, Tesla, Chainsaw or Cluster Grenade, which cast or build their own).
+// ---------------------------------------------------------------------------
+struct SwapState { uint64_t orig, applied; };
+std::unordered_map<uint64_t, SwapState> g_swap;   // weapon -> prefabs
+
+// Empties the pool. ShootBullet scans from lastBulletUsed+1 round to
+// lastBulletUsed, so that index must be reset with it: left pointing past the
+// new, shorter list the scan never terminates when every bullet is in flight
+// (the game hangs). With 0, the scan of a fresh list behaves as at startup.
+void ResetPool(uint64_t w) {
+    uint64_t l = mem::Read<uint64_t>(w + g_o.wBullets);
+    if (!mem::Ptr(l) || !Klass(l)) return;
+    mem::Write<int>(w + g_o.wLastBullet, 0);
+    mem::Write<int>(l + 0x18, 0);
+}
+
+void UndoSwap(uint64_t w) {
+    auto it = g_swap.find(w);
+    if (it == g_swap.end()) return;
+    if (mem::Ptr(it->second.orig) && mem::Read<uint64_t>(w + g_o.wPrefab) == it->second.applied) {
+        mem::Write<uint64_t>(w + g_o.wPrefab, it->second.orig);
+        ResetPool(w);
+    }
+    g_swap.erase(it);
+}
+
+void ApplyBulletSwap(uint64_t player) {
+    if (!g_cfg.bulletSwap) {
+        while (!g_swap.empty()) UndoSwap(g_swap.begin()->first);
+        return;
+    }
+    int t = g_cfg.bulletType; if (t < 0 || t > 3) t = 0;
+    uint64_t list = mem::Read<uint64_t>(player + g_o.pWeapons);
+    uint64_t donor = 0;
+    ForList(list, [&](uint64_t w) { if (!donor && Klass(w) == g_o.kDonor[t]) donor = mem::Read<uint64_t>(w + g_o.wPrefab); });
+    if (!mem::Ptr(donor)) return;
+    ForList(list, [&](uint64_t w) {
+        uint64_t k = Klass(w);
+        if (!g_o.kSwapOK.count(k)) return;
+        if (k == g_o.kDonor[t]) { UndoSwap(w); return; }     // already fires these bullets
+        auto it = g_swap.find(w);
+        if (it == g_swap.end()) it = g_swap.emplace(w, SwapState{ mem::Read<uint64_t>(w + g_o.wPrefab), 0 }).first;
+        if (it->second.applied != donor) {
+            mem::Write<uint64_t>(w + g_o.wPrefab, donor);
+            ResetPool(w);
+            it->second.applied = donor;
+            log_::Info("[test] bullet swap type %d on weapon %llX", t, w);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+//  Drops. Items live in Level.gameObjectsByID, a Dictionary<int, YAZDObject>.
+//  Its field offsets are read from the live object's class the first time it
+//  exists; entries are { int hashCode; int next; int key; [pad]; obj value }.
+//  An int key hashes to itself, so key == hashCode on every used entry, which
+//  is checked before trusting the layout.
+// ---------------------------------------------------------------------------
+bool DictReady() {
+    if (g_o.dictBad) return false;
+    if (g_o.dEntries > 0) return true;
+    uint64_t d = mem::Read<uint64_t>(g_o.sObjById);
+    if (!mem::Ptr(d)) return false;
+    uint64_t k = Klass(d);
+    if (!k) return false;
+    int e = mono::FieldOffset(k, "entries");  if (e <= 0) e = mono::FieldOffset(k, "_entries");
+    int n = mono::FieldOffset(k, "count");    if (n <= 0) n = mono::FieldOffset(k, "_count");
+    if (e <= 0 || n <= 0) { g_o.dictBad = true; log_::Error("gameObjectsByID layout not found"); return false; }
+    g_o.dEntries = e; g_o.dCount = n;
+    log_::Info("drops: dictionary entries=+%X count=+%X", e, n);
+    return true;
+}
+
+template <class Fn> void ForDrops(Fn&& f) {
+    if (!DictReady()) return;
+    uint64_t d = mem::Read<uint64_t>(g_o.sObjById);
+    if (!mem::Ptr(d)) return;
+    uint64_t arr = mem::Read<uint64_t>(d + g_o.dEntries);
+    int n = mem::Read<int>(d + g_o.dCount);
+    if (!mem::Ptr(arr) || n <= 0 || n > 20000 || (uint64_t)n > mem::Read<uint64_t>(arr + 0x18)) return;
+    struct E { int hash, next, key, pad; uint64_t val; };
+    std::vector<E> es(n);
+    if (!mem::ReadRaw(arr + 0x20, es.data(), n * sizeof(E))) return;
+    for (auto& e : es) {
+        if (e.hash < 0) continue;                                       // free slot
+        if (e.key != e.hash) { g_o.dictBad = true; log_::Error("gameObjectsByID entry layout mismatch"); return; }
+        if (!mem::Ptr(e.val)) continue;
+        uint64_t k = Klass(e.val);
+        for (int t = 0; t < 4; ++t) if (k == g_o.kItemType[t]) { f(e.val, t); break; }
+    }
 }
 
 void ApplyEconomy() {
@@ -509,6 +666,7 @@ void ApplyEconomy() {
 }
 
 void RestoreAll() {
+    while (!g_swap.empty()) UndoSwap(g_swap.begin()->first);
     if (!g_cash.empty()) { bool on = g_cfg.cashMultOn; g_cfg.cashMultOn = false; ApplyCashMult(LevelObj()); g_cfg.cashMultOn = on; }
     uint64_t p = LocalPlayer();
     if (!p) return;
@@ -596,6 +754,17 @@ void BuildSnapshot() {
             s.enemies.push_back(std::move(e));
         });
     }
+    if (g_cfg.esp && g_cfg.espDrops && (s.mode == Mode::Night || s.mode == Mode::Day))
+        ForDrops([&](uint64_t it, int type) {
+            if (mem::Read<bool>(it + g_o.itCollected)) return;
+            Drop d{};
+            mem::ReadRaw(it + g_o.oPos, &d.pos, sizeof(Vec3));
+            d.type = type;
+            d.sub = type == 3 ? mem::Read<int>(it + g_o.puType) : -1;
+            d.timeLeft = mem::Read<float>(it + g_o.itRemoveAfter) - mem::Read<float>(it + g_o.oLife);
+            if (d.timeLeft < 0.f || d.timeLeft > 600.f) return;
+            s.drops.push_back(d);
+        });
     std::lock_guard<std::mutex> lk(g_snapMx);
     g_snap = std::move(s);
 }
@@ -610,7 +779,7 @@ void Detach(const char* why) {
     g_attached = false;
     g_saved = Saved{};
     g_cash.clear(); g_barricadeHp.clear(); g_online = false;
-    g_bulletLife.clear(); g_redirected.clear(); g_teleported.clear();
+    g_bullets.clear(); g_swap.clear();
     { std::lock_guard<std::mutex> lk(g_snapMx); g_snap = Snapshot{}; }
     SetStatus("waiting for game");
 }
@@ -700,6 +869,7 @@ void Loop() {
                 if (uint64_t p = LocalPlayer()) ApplyPlayer(p);
                 if (m == Mode::Night) { ApplyEnemies(lvl); ApplyCashMult(lvl); }
                 if (m == Mode::Night) if (uint64_t p = LocalPlayer()) ApplyAim(p, lvl);
+                if (uint64_t p = LocalPlayer()) ApplyBulletSwap(p);
                 ApplyDefenses(lvl);
                 ApplyEconomy();
             }
@@ -831,7 +1001,7 @@ std::vector<BoolKey> BoolKeys() {
              {"infAmmo",&c.infAmmo},{"rapidFire",&c.rapidFire},{"instantReload",&c.instantReload},{"infClips",&c.infClips},
              {"freezeEnemies",&c.freezeEnemies},{"oneHit",&c.oneHit},{"lockCash",&c.lockCash},
              {"cashMultOn",&c.cashMultOn},{"aimbot",&c.aimbot},{"aimDrawFov",&c.aimDrawFov},{"triggerbot",&c.triggerbot},
-             {"silentAim",&c.silentAim},{"magicBullet",&c.magicBullet},{"magicInstant",&c.magicInstant},{"godBarricades",&c.godBarricades},{"turretAmmo",&c.turretAmmo},{"turretRapid",&c.turretRapid},
+             {"silentAim",&c.silentAim},{"bulletSwap",&c.bulletSwap},{"espDrops",&c.espDrops},{"espDropTimer",&c.espDropTimer},{"magicBullet",&c.magicBullet},{"magicInstant",&c.magicInstant},{"godBarricades",&c.godBarricades},{"turretAmmo",&c.turretAmmo},{"turretRapid",&c.turretRapid},
              {"esp",&c.esp},{"espLines",&c.espLines},{"espInfo",&c.espInfo},{"espHealth",&c.espHealth},
              {"espEnemies",&c.espEnemies},{"espPlayers",&c.espPlayers},{"espLocal",&c.espLocal} };
 }
@@ -841,6 +1011,7 @@ std::string SaveConfig() {
     if (!f) return "Could not write settings file.";
     for (auto& b : BoolKeys()) fprintf(f, "%s=%d\n", b.k, b.v->load() ? 1 : 0);
     fprintf(f, "lockCashValue=%g\nespMaxDist=%g\ncashMult=%g\n", g_cfg.lockCashValue.load(), g_cfg.espMaxDist.load(), g_cfg.cashMult.load());
+    fprintf(f, "bulletType=%d\n", g_cfg.bulletType.load());
     fprintf(f, "aimKey=%d\naimFov=%g\naimSmooth=%g\naimRange=%g\ntrigWidth=%g\nsilentFov=%g\n", g_cfg.aimKey.load(),
         g_cfg.aimFov.load(), g_cfg.aimSmooth.load(), g_cfg.aimRange.load(), g_cfg.trigWidth.load(), g_cfg.silentFov.load());
     fclose(f);
@@ -862,6 +1033,7 @@ std::string LoadConfig() {
         if (strcmp(line, "espMaxDist") == 0) g_cfg.espMaxDist = (float)atof(val);
         if (strcmp(line, "cashMult") == 0) g_cfg.cashMult = (float)atof(val);
         if (strcmp(line, "aimKey") == 0) g_cfg.aimKey = atoi(val);
+        if (strcmp(line, "bulletType") == 0) g_cfg.bulletType = atoi(val);
         if (strcmp(line, "aimFov") == 0) g_cfg.aimFov = (float)atof(val);
         if (strcmp(line, "aimSmooth") == 0) g_cfg.aimSmooth = (float)atof(val);
         if (strcmp(line, "aimRange") == 0) g_cfg.aimRange = (float)atof(val);

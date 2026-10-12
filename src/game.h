@@ -28,6 +28,13 @@ struct Entity {
     std::string name;
 };
 
+struct Drop {
+    Vec3  pos;
+    int   type;          // 0 cash, 1 ammo, 2 health, 3 powerup
+    int   sub;           // powerup type for powerups, else -1
+    float timeLeft;      // seconds until it despawns
+};
+
 struct Snapshot {
     bool  valid = false;
     Mode  mode = Mode::None;
@@ -37,6 +44,7 @@ struct Snapshot {
     int   gameX = 0, gameY = 0;    // client origin in screen coordinates
     std::vector<Entity> players;
     std::vector<Entity> enemies;
+    std::vector<Drop>   drops;
     // local player / economy readouts for the UI
     float hp = 0, maxHp = 0, cash = 0, ammo = 0;
     int   score = 0, night = 0, statPoints = 0, weaponId = -1, clips = 0;
@@ -72,6 +80,9 @@ struct Config {
     std::atomic<bool>  silentAim{false};
     std::atomic<float> silentFov{60.f};           // degrees around the facing direction
     std::atomic<bool>  magicBullet{false}, magicInstant{false};
+    // bullet swap: your guns fire another weapon's bullets
+    std::atomic<bool>  bulletSwap{false};
+    std::atomic<int>   bulletType{0};             // 0 rocket, 1 freeze, 2 blaster, 3 sniper
     // economy
     std::atomic<bool>  lockCash{false};
     std::atomic<float> lockCashValue{50000.f};
@@ -79,6 +90,7 @@ struct Config {
     std::atomic<bool>  esp{false}, espLines{false}, espInfo{true}, espHealth{true};
     std::atomic<bool>  espEnemies{true}, espPlayers{true}, espLocal{false};
     std::atomic<float> espMaxDist{60.f};
+    std::atomic<bool>  espDrops{true}, espDropTimer{true};
 };
 
 Config& Cfg();
