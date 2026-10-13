@@ -4,7 +4,6 @@
 
 ### A fully external ImGui (DX11) overlay trainer for Yet Another Zombie Defense HD
 
-Offsets are looked up by name · one native x64 executable · nothing is injected
 
 https://www.youtube.com/watch?v=x_VzO76rfsI
 
